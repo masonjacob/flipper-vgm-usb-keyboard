@@ -1,0 +1,11 @@
+App(
+    appid="usb_text_writer",
+    name="USB Text Writer",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="usb_text_writer_app",
+    requires=["gui", "storage", "expansion"],
+    stack_size=8 * 1024,
+    fap_category="Tools",
+    fap_version="1.0",
+    fap_description="Use a USB keyboard on the VGM to write a text file",
+)
