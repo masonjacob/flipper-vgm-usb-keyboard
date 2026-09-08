@@ -1,8 +1,8 @@
 App(
-    appid="usb_text_writer",
-    name="USB Text Writer",
+    appid="vgm_usb_keyboard",
+    name="VGM USB Keyboard",
     apptype=FlipperAppType.EXTERNAL,
-    entry_point="usb_text_writer_app",
+    entry_point="vgm_usb_keyboard_app",
     requires=["gui", "storage", "expansion"],
     stack_size=8 * 1024,
     fap_category="Tools",

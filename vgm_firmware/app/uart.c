@@ -4,15 +4,19 @@
 #include <pico/stdlib.h>
 #include <hardware/gpio.h>
 #include <hardware/uart.h>
+
 #include <FreeRTOS.h>
 #include <task.h>
+#include <semphr.h>
 
-#define UART_ID uart0
-#define UART_TX_PIN 0
-#define UART_RX_PIN 1
-#define UART_BAUD_RATE 460800UL
+#define UART_ID            uart0
+#define UART_IRQ           UART0_IRQ
+#define UART_TX_PIN        0
+#define UART_RX_PIN        1
+#define UART_BAUD_RATE     460800UL
 
-static bool handshake_done = false;
+static volatile bool handshake_done = false;
+static SemaphoreHandle_t tx_mutex = NULL;
 
 static void uart_init_pins(void) {
     uart_init(UART_ID, UART_BAUD_RATE);
@@ -26,7 +30,11 @@ static void uart_init_pins(void) {
     gpio_set_pulls(UART_TX_PIN, true, false);
 }
 
-static bool magic_match_step(uint8_t ch, uint8_t const magic[KBW_MAGIC_LEN], size_t* index) {
+static bool magic_match_step(
+    uint8_t ch,
+    const uint8_t magic[KBW_MAGIC_LEN],
+    size_t* index) {
+
     if(ch == magic[*index]) {
         (*index)++;
         if(*index == KBW_MAGIC_LEN) {
@@ -34,9 +42,23 @@ static bool magic_match_step(uint8_t ch, uint8_t const magic[KBW_MAGIC_LEN], siz
             return true;
         }
     } else {
-        *index = (ch == magic[0]) ? 1 : 0;
+        *index = (ch == magic[0]) ? 1u : 0u;
     }
+
     return false;
+}
+
+static void uart_send_bytes(const uint8_t* data, size_t len) {
+    if(tx_mutex) {
+        xSemaphoreTake(tx_mutex, portMAX_DELAY);
+    }
+
+    uart_write_blocking(UART_ID, data, len);
+    uart_tx_wait_blocking(UART_ID);
+
+    if(tx_mutex) {
+        xSemaphoreGive(tx_mutex);
+    }
 }
 
 static bool uart_wait_for_start(uint32_t timeout_ms) {
@@ -45,13 +67,14 @@ static bool uart_wait_for_start(uint32_t timeout_ms) {
 
     while(absolute_time_diff_us(get_absolute_time(), deadline) > 0) {
         while(uart_is_readable(UART_ID)) {
-            uint8_t ch = uart_getc(UART_ID);
+            const uint8_t ch = uart_getc(UART_ID);
+
             if(magic_match_step(ch, kbw_host_magic, &magic_index)) {
-                uart_write_blocking(UART_ID, kbw_ack_magic, KBW_MAGIC_LEN);
-                uart_tx_wait_blocking(UART_ID);
+                uart_send_bytes(kbw_ack_magic, sizeof(kbw_ack_magic));
                 return true;
             }
         }
+
         vTaskDelay(pdMS_TO_TICKS(2));
     }
 
@@ -60,51 +83,52 @@ static bool uart_wait_for_start(uint32_t timeout_ms) {
 
 static void uart_task(void* context) {
     (void)context;
+
     uart_init_pins();
 
     while(true) {
-        handshake_done = false;
+        handshake_done = uart_wait_for_start(1000);
 
-        if(uart_wait_for_start(1000)) {
-            handshake_done = true;
-        }
-
-        while(handshake_done) {
+        if(handshake_done) {
             /*
-             * If the Flipper app disappears, the next keyboard event may still
-             * be buffered. The app will re-run the handshake when restarted.
-             * A fresh "KBW1" received here causes another ACK.
+             * Stay alive and acknowledge repeated handshakes. Keyboard data
+             * only travels VGM -> Flipper, so there is nothing else to parse.
              */
-            while(uart_is_readable(UART_ID)) {
-                uint8_t ch = uart_getc(UART_ID);
-                static uint8_t idx = 0;
+            size_t magic_index = 0;
 
-                if(magic_match_step(ch, kbw_host_magic, &idx)) {
-                    uart_write_blocking(UART_ID, kbw_ack_magic, KBW_MAGIC_LEN);
-                    uart_tx_wait_blocking(UART_ID);
-                    continue;
+            while(true) {
+                while(uart_is_readable(UART_ID)) {
+                    const uint8_t ch = uart_getc(UART_ID);
+
+                    if(magic_match_step(
+                           ch,
+                           kbw_host_magic,
+                           &magic_index)) {
+                        uart_send_bytes(
+                            kbw_ack_magic,
+                            sizeof(kbw_ack_magic));
+                    }
                 }
 
-                /*
-                 * Ignore non-handshake bytes. Keyboard events only go in the
-                 * VGM -> Flipper direction.
-                 */
+                vTaskDelay(pdMS_TO_TICKS(5));
             }
-
-            vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
 }
 
 void uart_protocol_init(void) {
+    tx_mutex = xSemaphoreCreateMutex();
+    configASSERT(tx_mutex != NULL);
+
     TaskHandle_t handle = NULL;
-    BaseType_t status = xTaskCreate(
+    const BaseType_t status = xTaskCreate(
         uart_task,
         "uart_task",
         2048,
         NULL,
         2,
         &handle);
+
     configASSERT(status == pdPASS);
     (void)handle;
 }
@@ -112,15 +136,14 @@ void uart_protocol_init(void) {
 void keyboard_uart_send_key(uint8_t modifiers, uint8_t usage) {
     if(!handshake_done) return;
 
-    uint8_t frame[4] = {
+    const uint8_t frame[4] = {
         KBW_FRAME_MAGIC,
         KBW_EVENT_KEY,
         modifiers,
         usage,
     };
 
-    uart_write_blocking(UART_ID, frame, sizeof(frame));
-    uart_tx_wait_blocking(UART_ID);
+    uart_send_bytes(frame, sizeof(frame));
 }
 
 bool keyboard_uart_is_ready(void) {

@@ -1,30 +1,39 @@
 #include "usb.h"
 #include "uart.h"
 
-#include <bsp/board_api.h>
-#include <tusb.h>
-
+#include <pico/stdlib.h>
 #include <FreeRTOS.h>
+#include <semphr.h>
 #include <task.h>
 
-static hid_keyboard_report_t previous_report = {0};
+#include "bsp/board.h"
+#include "tusb.h"
 
-static bool report_contains_key(hid_keyboard_report_t const* report, uint8_t usage) {
+static hid_keyboard_report_t previous_report = {
+    .modifier = 0,
+    .reserved = 0,
+    .keycode = {0},
+};
+
+static bool report_contains_key(
+    const hid_keyboard_report_t* report,
+    uint8_t usage) {
+
     for(uint8_t i = 0; i < 6; ++i) {
         if(report->keycode[i] == usage) return true;
     }
+
     return false;
 }
 
-static void process_keyboard_report(hid_keyboard_report_t const* report) {
+static void process_keyboard_report(
+    const hid_keyboard_report_t* report) {
+
     for(uint8_t i = 0; i < 6; ++i) {
-        uint8_t usage = report->keycode[i];
+        const uint8_t usage = report->keycode[i];
+
         if(usage == 0) continue;
 
-        /* Only emit transitions; held keys are intentionally repeated by
-         * the physical keyboard at the HID report level. We keep this
-         * implementation deterministic and let the editor handle repeats
-         * by receiving fresh key presses from the keyboard. */
         if(!report_contains_key(&previous_report, usage)) {
             keyboard_uart_send_key(report->modifier, usage);
         }
@@ -36,21 +45,16 @@ static void process_keyboard_report(hid_keyboard_report_t const* report) {
 static void usb_host_task(void* context) {
     (void)context;
 
-    const tusb_rhport_init_t rh_init = {
-        .role = TUSB_ROLE_HOST,
-        .speed = TUSB_SPEED_AUTO,
-    };
+    board_init();
 
     /*
-     * The module's RP2040 USB-C port is documented as supporting host mode.
-     * `tinyusb_board` supplies the board-level host controller glue.
+     * Native RP2040 USB host port. The VGM's USB-C connector is documented
+     * as usable as a host by custom firmware.
      */
-    board_init();
-    if(!tusb_rhport_init(BOARD_TUH_RHPORT, &rh_init)) {
+    if(!tuh_init(BOARD_TUH_RHPORT)) {
         vTaskDelete(NULL);
         return;
     }
-    board_init_after_tusb();
 
     while(true) {
         tuh_task();
@@ -63,18 +67,35 @@ void tuh_hid_mount_cb(
     uint8_t instance,
     uint8_t const* desc_report,
     uint16_t desc_len) {
+
     (void)desc_report;
     (void)desc_len;
 
-    if(tuh_hid_interface_protocol(dev_addr, instance) == HID_ITF_PROTOCOL_KEYBOARD) {
-        tuh_hid_receive_report(dev_addr, instance);
+    const uint8_t protocol =
+        tuh_hid_interface_protocol(dev_addr, instance);
+
+    if(protocol == HID_ITF_PROTOCOL_KEYBOARD) {
+        previous_report = (hid_keyboard_report_t){
+            .modifier = 0,
+            .reserved = 0,
+            .keycode = {0},
+        };
+
+        if(!tuh_hid_receive_report(dev_addr, instance)) {
+            /* Device mounted but first report request failed. */
+        }
     }
 }
 
 void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance) {
     (void)dev_addr;
     (void)instance;
-    previous_report = (hid_keyboard_report_t){0};
+
+    previous_report = (hid_keyboard_report_t){
+        .modifier = 0,
+        .reserved = 0,
+        .keycode = {0},
+    };
 }
 
 void tuh_hid_report_received_cb(
@@ -82,23 +103,32 @@ void tuh_hid_report_received_cb(
     uint8_t instance,
     uint8_t const* report,
     uint16_t len) {
-    if(len >= sizeof(hid_keyboard_report_t) &&
-       tuh_hid_interface_protocol(dev_addr, instance) == HID_ITF_PROTOCOL_KEYBOARD) {
-        process_keyboard_report((hid_keyboard_report_t const*)report);
+
+    const uint8_t protocol =
+        tuh_hid_interface_protocol(dev_addr, instance);
+
+    if(protocol == HID_ITF_PROTOCOL_KEYBOARD &&
+       len >= sizeof(hid_keyboard_report_t)) {
+        process_keyboard_report(
+            (const hid_keyboard_report_t*)report);
     }
 
-    tuh_hid_receive_report(dev_addr, instance);
+    if(!tuh_hid_receive_report(dev_addr, instance)) {
+        /* Device disconnected or stopped accepting reports. */
+    }
 }
 
 void usb_init(void) {
     TaskHandle_t handle = NULL;
-    BaseType_t status = xTaskCreate(
+
+    const BaseType_t status = xTaskCreate(
         usb_host_task,
         "usb_host",
-        3072,
+        4096,
         NULL,
         3,
         &handle);
+
     configASSERT(status == pdPASS);
     (void)handle;
 }

@@ -6,24 +6,18 @@
 
 #include "uart.h"
 #include "usb.h"
-#include "led.h"
-
-static uint32_t clock_khz_default(void) {
-    return 133000;
-}
 
 static void init(void) {
-    led_init();
-
-    sleep_ms(10);
+    /*
+     * Keep the VGM clock configuration conservative. USB host operation uses
+     * the RP2040 native USB controller in the bundled TinyUSB port.
+     */
     vreg_set_voltage(VREG_VOLTAGE_1_10);
     sleep_ms(10);
-    set_sys_clock_khz(clock_khz_default(), true);
+    set_sys_clock_khz(133000, true);
 
     uart_protocol_init();
     usb_init();
-
-    led_red(false);
 }
 
 int main(void) {
@@ -31,9 +25,7 @@ int main(void) {
 
     vTaskStartScheduler();
 
-    while(1) {
-        __wfe();
+    for(;;) {
+        tight_loop_contents();
     }
-
-    __builtin_unreachable();
 }
